@@ -5,6 +5,8 @@ import cnfgen
 import json
 from pysat.solvers import Glucose3
 from dotenv import load_dotenv
+import argparse
+import csv
 
 # global variables
 model_string = "mistralai/devstral-small-2505:free"
@@ -31,7 +33,7 @@ def generate_3sat_problem(num_vars=8, num_clauses=5, file_path="problem.cnf"):
     Returns:
         str: The path to the saved CNF file.
     """
-    print(f"Generating a 3-SAT problem with {num_vars} variables and {num_clauses} clauses...")
+    #print(f"Generating a 3-SAT problem with {num_vars} variables and {num_clauses} clauses...")
     # k=3 for 3-SAT, i=num_clauses, n=num_vars
     problem = cnfgen.RandomKCNF(3, num_vars, num_clauses)
     # Write to a temporary file first
@@ -43,7 +45,7 @@ def generate_3sat_problem(num_vars=8, num_clauses=5, file_path="problem.cnf"):
             if i >= 6:
                 fout.write(line)
     os.remove(temp_path)
-    print(f"Problem saved to {file_path}")
+    #print(f"Problem saved to {file_path}")
     return file_path
 
 # --- 2. Query the LLM for a Solution ---
@@ -66,20 +68,43 @@ def query_llm_for_solution(cnf_file_path):
             cnf_content = f.read()
 
         prompt = f"""
-        The following is a boolean satisfiability problem in DIMACS CNF format.
-        Is this formula satisfiable? If it is, provide a satisfying assignment.
-        A satisfying assignment is a list of integers where a positive integer 'v' means variable 'v' is true,
-        and a negative integer '-v' means variable 'v' is false.
-        For example: [1, -2, 3, -4, 5]
+        You will evaluate a boolean satisfiability (SAT) problem presented in DIMACS CNF format.
+
+        CNF FORMAT EXPLANATION:
+        - Each line represents a clause (disjunction of literals)
+        - Positive integers represent variables (e.g., 3 means variable x3)
+        - Negative integers represent negated variables (e.g., -3 means NOT x3)
+        - Each clause ends with 0
+        - A clause like "1 -3 4 0" means (x1 OR NOT x3 OR x4)
+
+        YOUR TASK:
+        Determine if there exists an assignment of true/false values to all variables that makes every clause true.
+
+        SOLUTION APPROACH:
+        1. Analyze the clauses to understand the constraints
+        2. Attempt to find a consistent assignment that satisfies all clauses
+        3. Verify your assignment by checking each clause
+
+        OUTPUT FORMAT:
+        - If satisfiable: 
+        Line 1: SATISFIABLE
+        Line 2: [comma-separated list of literals]
+        Example: SATISFIABLE
+                [1, -2, 3, -4, 5]
+        
+        - If unsatisfiable:
+        Line 1: UNSATISFIABLE
+
+        IMPORTANT NOTES:
+        - Your assignment must include ALL variables (either positive or negative)
+        - Each variable appears exactly once in the assignment
+        - Positive integer v means variable v is TRUE
+        - Negative integer -v means variable v is FALSE
+        - Do not include any explanation or additional text
+        - Ensure your assignment actually satisfies all clauses before responding
 
         Problem:
         {cnf_content}
-
-        You must follow these rules for your response:
-        If satisfiable, your answer should start with "SATISFIABLE" on the first line,
-        followed by the satisfying assignment on the next line.
-        If unsatisfiable, simply respond with "UNSATISFIABLE".
-        No other text should be included in your response.
         """
 
         response = requests.post(
@@ -123,7 +148,7 @@ def solve_locally(cnf_file_path):
         tuple: A tuple containing (is_satisfiable, model), where model is the
                satisfying assignment if one exists.
     """
-    print("Solving the problem locally with py-sat...")
+    #print("Solving the problem locally with py-sat...")
     solver = Glucose3()
     # Read the CNF file and add clauses to the solver
     with open(cnf_file_path, "r") as f:
@@ -139,7 +164,7 @@ def solve_locally(cnf_file_path):
     model = solver.get_model() if is_satisfiable else None
     
     solver.delete()
-    print("Local solver finished.")
+    #print("Local solver finished.")
     return is_satisfiable, model
 
 # --- 4. Verify the LLM's Solution ---
@@ -232,16 +257,100 @@ def verify_llm_solution(llm_response, local_is_sat, local_model):
         print(f"\n⚠️ PARSING ERROR: Could not parse the model from the LLM's response. Error: {e}")
         print("The LLM claimed SATISFIABLE, but its formatting was incorrect.")
 
+# --- Utility: Generate seeds for 50/50 SAT/UNSAT split ---
+def generate_sat_unsat_seeds(num_vars, num_clauses, num_each, output_file):
+    """
+    Finds seeds that generate satisfiable and unsatisfiable problems for given num_vars and num_clauses.
+    Writes the seeds to output_file in the specified format.
+    """
+    temp_cnf_file = "temp_problem.cnf"
+    sat_seeds = []
+    unsat_seeds = []
+    seed = 0
+    while len(sat_seeds) < num_each or len(unsat_seeds) < num_each:
+        random.seed(seed)
+        generate_3sat_problem(num_vars=num_vars, num_clauses=num_clauses, file_path=temp_cnf_file)
+        is_sat, model = solve_locally(temp_cnf_file)
+        if is_sat and len(sat_seeds) < num_each:
+            sat_seeds.append(seed)
+        elif not is_sat and len(unsat_seeds) < num_each:
+            unsat_seeds.append(seed)
+        seed += 1
+    with open(output_file, "w") as f:
+        f.write(f"num_vars: {num_vars} num_clauses: {num_clauses}\n")
+        f.write("SAT: " + ", ".join(str(s) for s in sat_seeds) + "\n")
+        f.write("UNSAT: " + ", ".join(str(s) for s in unsat_seeds) + "\n")
+    print(f"Seeds written to {output_file}")
 
 # --- Main Execution ---
 if __name__ == "__main__":
-    # Generate the problem
-    cnf_file = generate_3sat_problem(num_vars=5, num_clauses=20)
-    
-    # Get solutions
-    llm_result = query_llm_for_solution(cnf_file)
-    is_sat, model = solve_locally(cnf_file)
-    
-    # Verify
-    verify_llm_solution(llm_result, is_sat, model)
+    parser = argparse.ArgumentParser(description="BoolBench: SAT problem generator and benchmark tool.")
+    subparsers = parser.add_subparsers(dest="mode", help="Mode of operation")
+
+    # Single-problem benchmark mode
+    single_parser = subparsers.add_parser("single", help="Run the old single-problem benchmark")
+    single_parser.add_argument("--num_vars", type=int, default=5, help="Number of variables")
+    single_parser.add_argument("--num_clauses", type=int, default=20, help="Number of clauses")
+
+    # Seed file generation mode
+    seedfile_parser = subparsers.add_parser("seedfile", help="Generate a text file with SAT/UNSAT seeds")
+    seedfile_parser.add_argument("--num_vars", type=int, default=5, help="Number of variables")
+    seedfile_parser.add_argument("--num_clauses", type=int, default=20, help="Number of clauses")
+    seedfile_parser.add_argument("--num_each", type=int, default=500, help="Number of SAT and UNSAT seeds to find")
+    seedfile_parser.add_argument("--output_file", type=str, default=None, help="Output file name (default: seeds_<num_vars>vars_<num_clauses>clauses.txt)")
+
+    # Seed file generation from CSV mode
+    seedfile_csv_parser = subparsers.add_parser("seedfile_csv", help="Generate SAT/UNSAT seed files for each parameter set in a CSV file")
+    seedfile_csv_parser.add_argument("--csv_file", type=str, required=True, help="CSV file with lines: num_vars,num_clauses")
+    seedfile_csv_parser.add_argument("--num_each", type=int, default=500, help="Number of SAT and UNSAT seeds to find for each parameter set")
+    seedfile_csv_parser.add_argument("--output_file", type=str, default="seeds_from_csv.txt", help="Output file name for all results")
+
+    args = parser.parse_args()
+
+    if args.mode == "single":
+        cnf_file = generate_3sat_problem(num_vars=args.num_vars, num_clauses=args.num_clauses)
+        llm_result = query_llm_for_solution(cnf_file)
+        is_sat, model = solve_locally(cnf_file)
+        print(f"Local solver result: {'SATISFIABLE' if is_sat else 'UNSATISFIABLE'}")
+        if is_sat:
+            print(f"Model: {model}")
+        verify_llm_solution(llm_result, is_sat, model)
+    elif args.mode == "seedfile":
+        output_file = args.output_file or f"seeds_{args.num_vars}vars_{args.num_clauses}clauses.txt"
+        generate_sat_unsat_seeds(num_vars=args.num_vars, num_clauses=args.num_clauses, num_each=args.num_each, output_file=output_file)
+    elif args.mode == "seedfile_csv":
+        with open(args.csv_file, newline='') as csvfile, open(args.output_file, "w") as outfile:
+            reader = csv.reader(csvfile)
+            for idx, row in enumerate(reader):
+                if not row or len(row) < 2:
+                    continue
+                try:
+                    n = int(row[0])
+                    m = int(row[1])
+                except ValueError:
+                    print(f"Skipping invalid row: {row}")
+                    continue
+                print(f"Generating seeds for num_vars={n}, num_clauses={m} ...")
+                # Use a helper to get the SAT/UNSAT seeds as strings
+                temp_cnf_file = "temp_problem.cnf"
+                sat_seeds = []
+                unsat_seeds = []
+                seed = 0
+                while len(sat_seeds) < args.num_each or len(unsat_seeds) < args.num_each:
+                    random.seed(seed)
+                    generate_3sat_problem(num_vars=n, num_clauses=m, file_path=temp_cnf_file)
+                    is_sat, model = solve_locally(temp_cnf_file)
+                    if is_sat and len(sat_seeds) < args.num_each:
+                        sat_seeds.append(seed)
+                    elif not is_sat and len(unsat_seeds) < args.num_each:
+                        unsat_seeds.append(seed)
+                    seed += 1
+                outfile.write(f"num_vars: {n} num_clauses: {m}\n")
+                outfile.write("SAT: " + ", ".join(str(s) for s in sat_seeds) + "\n")
+                outfile.write("UNSAT: " + ", ".join(str(s) for s in unsat_seeds) + "\n")
+                if idx != 0:
+                    outfile.write("\n")
+                print(f"Seeds for num_vars={n}, num_clauses={m} written.")
+    else:
+        parser.print_help()
     

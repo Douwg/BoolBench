@@ -208,3 +208,8 @@ __marimo__/
 
 # Our stuff
 problem.cnf
+
+.python-version
+pyproject.toml
+temp_problem.cnf
+uv.lock
