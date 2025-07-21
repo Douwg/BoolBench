@@ -7,7 +7,7 @@ from pysat.solvers import Glucose3
 from dotenv import load_dotenv
 
 # global variables
-model_string = "mistralai/devstral-small-2505:free"
+model_string = "mistralai/devstral-small-2505:free"#"google/gemini-2.5-pro"#"google/gemini-2.5-flash"#"mistralai/devstral-small-2505:free"
 
 # --- Configuration ---
 # You will need to set your OpenRouter API key as an environment variable.
@@ -236,7 +236,7 @@ def verify_llm_solution(llm_response, local_is_sat, local_model):
 # --- Main Execution ---
 if __name__ == "__main__":
     # Generate the problem
-    cnf_file = generate_3sat_problem(num_vars=5, num_clauses=20)
+    cnf_file = generate_3sat_problem(num_vars=10, num_clauses=43)
     
     # Get solutions
     llm_result = query_llm_for_solution(cnf_file)
