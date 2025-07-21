@@ -7,9 +7,10 @@ from pysat.solvers import Glucose3
 from dotenv import load_dotenv
 import argparse
 import csv
+import re # Added for balancedtest mode
 
 # global variables
-model_string = "mistralai/devstral-small-2505:free"#"google/gemini-2.5-pro"#"google/gemini-2.5-flash"#"mistralai/devstral-small-2505:free"
+model_string = "google/gemini-2.5-flash"#"google/gemini-2.5-pro"#"google/gemini-2.5-flash"#"mistralai/devstral-small-2505:free"
 
 # --- Configuration ---
 # You will need to set your OpenRouter API key as an environment variable.
@@ -68,7 +69,7 @@ def query_llm_for_solution(cnf_file_path):
             cnf_content = f.read()
 
         prompt = f"""
-        You will evaluate a boolean satisfiability (SAT) problem presented in DIMACS CNF format.
+       You will evaluate a boolean satisfiability (SAT) problem presented in DIMACS CNF format.
 
         CNF FORMAT EXPLANATION:
         - Each line represents a clause (disjunction of literals)
@@ -83,7 +84,7 @@ def query_llm_for_solution(cnf_file_path):
         SOLUTION APPROACH:
         1. Analyze the clauses to understand the constraints
         2. Attempt to find a consistent assignment that satisfies all clauses
-        3. Verify your assignment by checking each clause
+        3. Verify your assignment by checking each clause. 
 
         OUTPUT FORMAT:
         - If satisfiable: 
@@ -282,75 +283,189 @@ def generate_sat_unsat_seeds(num_vars, num_clauses, num_each, output_file):
         f.write("UNSAT: " + ", ".join(str(s) for s in unsat_seeds) + "\n")
     print(f"Seeds written to {output_file}")
 
-# --- Main Execution ---
-if __name__ == "__main__":
+def run_single(args):
+    cnf_file = generate_3sat_problem(num_vars=args.num_vars, num_clauses=args.num_clauses)
+    llm_result = query_llm_for_solution(cnf_file)
+    is_sat, model = solve_locally(cnf_file)
+    print(f"Local solver result: {'SATISFIABLE' if is_sat else 'UNSATISFIABLE'}")
+    if is_sat:
+        print(f"Model: {model}")
+    verify_llm_solution(llm_result, is_sat, model)
+
+def run_seedfile(args):
+    output_file = args.output_file or f"seeds_{args.num_vars}vars_{args.num_clauses}clauses.txt"
+    generate_sat_unsat_seeds(num_vars=args.num_vars, num_clauses=args.num_clauses, num_each=args.num_each, output_file=output_file)
+
+def run_seedfile_csv(args):
+    with open(args.csv_file, newline='') as csvfile, open(args.output_file, "w") as outfile:
+        reader = csv.reader(csvfile)
+        for idx, row in enumerate(reader):
+            if not row or len(row) < 2:
+                continue
+            try:
+                n = int(row[0])
+                m = int(row[1])
+            except ValueError:
+                print(f"Skipping invalid row: {row}")
+                continue
+            print(f"Generating seeds for num_vars={n}, num_clauses={m} ...")
+            temp_cnf_file = "temp_problem.cnf"
+            sat_seeds = []
+            unsat_seeds = []
+            seed = 0
+            while len(sat_seeds) < args.num_each or len(unsat_seeds) < args.num_each:
+                random.seed(seed)
+                generate_3sat_problem(num_vars=n, num_clauses=m, file_path=temp_cnf_file)
+                is_sat, model = solve_locally(temp_cnf_file)
+                if is_sat and len(sat_seeds) < args.num_each:
+                    sat_seeds.append(seed)
+                elif not is_sat and len(unsat_seeds) < args.num_each:
+                    unsat_seeds.append(seed)
+                seed += 1
+            outfile.write(f"num_vars: {n} num_clauses: {m}\n")
+            outfile.write("SAT: " + ", ".join(str(s) for s in sat_seeds) + "\n")
+            outfile.write("UNSAT: " + ", ".join(str(s) for s in unsat_seeds) + "\n")
+            if idx != 0:
+                outfile.write("\n")
+            print(f"Seeds for num_vars={n}, num_clauses={m} written.")
+
+def run_balancedtest(args):
+    with open("balanced_seeds.txt", "r") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    found = False
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("num_vars:"):
+            m = re.match(r"num_vars:\s*(\d+)\s+num_clauses:\s*(\d+)", lines[i])
+            if m and int(m.group(1)) == args.num_vars:
+                num_clauses = int(m.group(2))
+                found = True
+                sat_seeds = []
+                unsat_seeds = []
+                j = i + 1
+                while j < len(lines) and (lines[j].startswith("SAT:") or lines[j].startswith("UNSAT:")):
+                    if lines[j].startswith("SAT:"):
+                        sat_seeds = [int(s.strip()) for s in lines[j].split(":", 1)[1].split(",") if s.strip()]
+                    elif lines[j].startswith("UNSAT:"):
+                        unsat_seeds = [int(s.strip()) for s in lines[j].split(":", 1)[1].split(",") if s.strip()]
+                    j += 1
+                break
+        i += 1
+    if not found:
+        print(f"No block found in balanced_seeds.txt for num_vars={args.num_vars}")
+        exit(1)
+    num_sat = len(sat_seeds)
+    num_unsat = len(unsat_seeds)
+    if args.sat_mode == "SAT":
+        selected_seeds = sat_seeds[:args.num_problems]
+        label = "SAT"
+    elif args.sat_mode == "UNSAT":
+        selected_seeds = unsat_seeds[:args.num_problems]
+        label = "UNSAT"
+    elif args.sat_mode == "balanced":
+        n_each = args.num_problems // 2
+        selected_seeds = []
+        for k in range(n_each):
+            if k < num_sat:
+                selected_seeds.append((sat_seeds[k], "SAT"))
+            if k < num_unsat:
+                selected_seeds.append((unsat_seeds[k], "UNSAT"))
+        if args.num_problems % 2 == 1:
+            if n_each < num_sat:
+                selected_seeds.append((sat_seeds[n_each], "SAT"))
+            elif n_each < num_unsat:
+                selected_seeds.append((unsat_seeds[n_each], "UNSAT"))
+    else:
+        print(f"Unknown sat_mode: {args.sat_mode}")
+        exit(1)
+    results = []
+    if args.sat_mode == "balanced":
+        for seed, label in selected_seeds:
+            random.seed(seed)
+            cnf_file = generate_3sat_problem(num_vars=args.num_vars, num_clauses=num_clauses, file_path="temp_balanced.cnf")
+            llm_result = query_llm_for_solution(cnf_file)
+            is_sat, model = solve_locally(cnf_file)
+            print(f"\nSeed {seed} [{label}]:")
+            verify_llm_solution(llm_result, is_sat, model)
+            lines = llm_result.strip().split('\n')
+            sat_claim = any("SATISFIABLE" in line.upper() and not "UNSATISFIABLE" in line.upper() for line in lines)
+            unsat_claim = any("UNSATISFIABLE" in line.upper() for line in lines)
+            if sat_claim and not unsat_claim:
+                llm_claims_sat = True
+            elif unsat_claim and not sat_claim:
+                llm_claims_sat = False
+            else:
+                llm_claims_sat = None
+            correct = (llm_claims_sat is not None) and ((llm_claims_sat and is_sat) or (not llm_claims_sat and not is_sat))
+            results.append((seed, label, is_sat, llm_claims_sat, correct))
+    else:
+        for seed in selected_seeds:
+            random.seed(seed)
+            cnf_file = generate_3sat_problem(num_vars=args.num_vars, num_clauses=num_clauses, file_path="temp_balanced.cnf")
+            llm_result = query_llm_for_solution(cnf_file)
+            is_sat, model = solve_locally(cnf_file)
+            print(f"\nSeed {seed} [{args.sat_mode}]:")
+            verify_llm_solution(llm_result, is_sat, model)
+            lines = llm_result.strip().split('\n')
+            sat_claim = any("SATISFIABLE" in line.upper() and not "UNSATISFIABLE" in line.upper() for line in lines)
+            unsat_claim = any("UNSATISFIABLE" in line.upper() for line in lines)
+            if sat_claim and not unsat_claim:
+                llm_claims_sat = True
+            elif unsat_claim and not sat_claim:
+                llm_claims_sat = False
+            else:
+                llm_claims_sat = None
+            correct = (llm_claims_sat is not None) and ((llm_claims_sat and is_sat) or (not llm_claims_sat and not is_sat))
+            results.append((seed, args.sat_mode, is_sat, llm_claims_sat, correct))
+    n_correct = sum(1 for r in results if r[4])
+    n_total = len(results)
+    n_sat = sum(1 for r in results if r[2])
+    n_unsat = n_total - n_sat
+    n_sat_correct = sum(1 for r in results if r[2] and r[4])
+    n_unsat_correct = sum(1 for r in results if not r[2] and r[4])
+    print(f"\nSummary: LLM was correct {n_correct} / {n_total} times for num_vars={args.num_vars}, mode={args.sat_mode}")
+    print(f"  SAT problems:     {n_sat_correct} / {n_sat} correct")
+    print(f"  UNSAT problems:   {n_unsat_correct} / {n_unsat} correct")
+    if os.path.exists("temp_balanced.cnf"):
+        os.remove("temp_balanced.cnf")
+
+def main():
     parser = argparse.ArgumentParser(description="BoolBench: SAT problem generator and benchmark tool.")
     subparsers = parser.add_subparsers(dest="mode", help="Mode of operation")
 
-    # Single-problem benchmark mode
     single_parser = subparsers.add_parser("single", help="Run the old single-problem benchmark")
     single_parser.add_argument("--num_vars", type=int, default=5, help="Number of variables")
     single_parser.add_argument("--num_clauses", type=int, default=20, help="Number of clauses")
 
-    # Seed file generation mode
     seedfile_parser = subparsers.add_parser("seedfile", help="Generate a text file with SAT/UNSAT seeds")
     seedfile_parser.add_argument("--num_vars", type=int, default=5, help="Number of variables")
     seedfile_parser.add_argument("--num_clauses", type=int, default=20, help="Number of clauses")
     seedfile_parser.add_argument("--num_each", type=int, default=500, help="Number of SAT and UNSAT seeds to find")
     seedfile_parser.add_argument("--output_file", type=str, default=None, help="Output file name (default: seeds_<num_vars>vars_<num_clauses>clauses.txt)")
 
-    # Seed file generation from CSV mode
     seedfile_csv_parser = subparsers.add_parser("seedfile_csv", help="Generate SAT/UNSAT seed files for each parameter set in a CSV file")
     seedfile_csv_parser.add_argument("--csv_file", type=str, required=True, help="CSV file with lines: num_vars,num_clauses")
     seedfile_csv_parser.add_argument("--num_each", type=int, default=500, help="Number of SAT and UNSAT seeds to find for each parameter set")
     seedfile_csv_parser.add_argument("--output_file", type=str, default="seeds_from_csv.txt", help="Output file name for all results")
 
+    balancedtest_parser = subparsers.add_parser("balancedtest", help="Test using seeds from balanced_seeds.txt for a given num_vars")
+    balancedtest_parser.add_argument("--num_vars", type=int, required=True, help="Number of variables (must match a block in balanced_seeds.txt)")
+    balancedtest_parser.add_argument("--sat_mode", type=str, choices=["SAT", "UNSAT", "balanced"], required=True, help="Which type of problems to test: SAT, UNSAT, or balanced")
+    balancedtest_parser.add_argument("--num_problems", type=int, default=10, help="Number of problems to test in this run")
+
     args = parser.parse_args()
 
     if args.mode == "single":
-        cnf_file = generate_3sat_problem(num_vars=args.num_vars, num_clauses=args.num_clauses)
-        llm_result = query_llm_for_solution(cnf_file)
-        is_sat, model = solve_locally(cnf_file)
-        print(f"Local solver result: {'SATISFIABLE' if is_sat else 'UNSATISFIABLE'}")
-        if is_sat:
-            print(f"Model: {model}")
-        verify_llm_solution(llm_result, is_sat, model)
+        run_single(args)
     elif args.mode == "seedfile":
-        output_file = args.output_file or f"seeds_{args.num_vars}vars_{args.num_clauses}clauses.txt"
-        generate_sat_unsat_seeds(num_vars=args.num_vars, num_clauses=args.num_clauses, num_each=args.num_each, output_file=output_file)
+        run_seedfile(args)
     elif args.mode == "seedfile_csv":
-        with open(args.csv_file, newline='') as csvfile, open(args.output_file, "w") as outfile:
-            reader = csv.reader(csvfile)
-            for idx, row in enumerate(reader):
-                if not row or len(row) < 2:
-                    continue
-                try:
-                    n = int(row[0])
-                    m = int(row[1])
-                except ValueError:
-                    print(f"Skipping invalid row: {row}")
-                    continue
-                print(f"Generating seeds for num_vars={n}, num_clauses={m} ...")
-                # Use a helper to get the SAT/UNSAT seeds as strings
-                temp_cnf_file = "temp_problem.cnf"
-                sat_seeds = []
-                unsat_seeds = []
-                seed = 0
-                while len(sat_seeds) < args.num_each or len(unsat_seeds) < args.num_each:
-                    random.seed(seed)
-                    generate_3sat_problem(num_vars=n, num_clauses=m, file_path=temp_cnf_file)
-                    is_sat, model = solve_locally(temp_cnf_file)
-                    if is_sat and len(sat_seeds) < args.num_each:
-                        sat_seeds.append(seed)
-                    elif not is_sat and len(unsat_seeds) < args.num_each:
-                        unsat_seeds.append(seed)
-                    seed += 1
-                outfile.write(f"num_vars: {n} num_clauses: {m}\n")
-                outfile.write("SAT: " + ", ".join(str(s) for s in sat_seeds) + "\n")
-                outfile.write("UNSAT: " + ", ".join(str(s) for s in unsat_seeds) + "\n")
-                if idx != 0:
-                    outfile.write("\n")
-                print(f"Seeds for num_vars={n}, num_clauses={m} written.")
+        run_seedfile_csv(args)
+    elif args.mode == "balancedtest":
+        run_balancedtest(args)
     else:
         parser.print_help()
+
+if __name__ == "__main__":
+    main()
     
